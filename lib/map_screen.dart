@@ -1,31 +1,37 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 
-/// A demo place, so there is something visible on the map while the real
-/// database layer is not wired up yet.
-class DemoPlace {
-  const DemoPlace({
-    required this.id,
-    required this.name,
-    required this.latitude,
-    required this.longitude,
-  });
+import 'data/sample_data.dart';
+import 'models/map_layer.dart';
+import 'models/place.dart';
+import 'models/search_result.dart';
+import 'services/geocoding_service.dart';
+import 'services/location_service.dart';
+import 'theme/app_tokens.dart';
+import 'widgets/floating_search.dart';
+import 'widgets/map_layers_sheet.dart';
+import 'widgets/place_card.dart';
+import 'widgets/place_marker.dart';
+import 'widgets/search_panel.dart';
+import 'widgets/transport_sheet.dart';
 
-  final String id;
-  final String name;
-  final double latitude;
-  final double longitude;
-
-  LatLng get point => LatLng(latitude, longitude);
-}
-
-/// Minimal map screen: OpenStreetMap raster tiles + tappable markers.
+/// The map screen.
 ///
-/// Tiles come from the free, key-less OSM public server, so no API key and no
-/// billing account is required. The `userAgentPackageName` is a stable,
-/// app-specific identifier that OSM asks every app to send; the attribution
-/// widget below is required to stay on screen.
+/// The map is the application, not a widget inside one: every control is a
+/// floating layer over the tile canvas, and the only opaque surface is the
+/// bottom sheet, which the user drags.
+///
+/// Structure, top to bottom:
+///   • floating search + category pills
+///   • floating control stack (layers, locate, zoom)
+///   • map with category markers and the user's own position
+///   • a draggable sheet carrying either the discovery prompt, a place card,
+///     or the transport planner
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
 
@@ -33,153 +39,1020 @@ class MapScreen extends StatefulWidget {
   State<MapScreen> createState() => _MapScreenState();
 }
 
+enum _SheetMode { discovery, place, picked, transport }
+
 class _MapScreenState extends State<MapScreen> {
   final MapController _mapController = MapController();
+  final GeocodingService _geocoding = GeocodingService();
+  final DeviceLocationService _location = const DeviceLocationService();
+  final TextEditingController _searchController = TextEditingController();
+  final DraggableScrollableController _sheetController =
+      DraggableScrollableController();
 
-  // Somewhere to land on first launch. Change this to any city.
-  static const LatLng _initialCenter = LatLng(12.9716, 77.5946); // Bengaluru
-  static const double _initialZoom = 13;
+  // ------------------------------------------------------------------ state
 
-  static const String _tileUrlTemplate =
-      'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
-  static const String _userAgentPackageName = 'com.revmap.revamp';
+  PlaceCategory? _activeCategory;
+  Place? _selectedPlace;
+  DeviceLocation? _myLocation;
+  bool _locating = false;
+  String? _statusMessage;
 
-  // Later this list comes from RevMap's own backend instead of being hardcoded.
-  static const List<DemoPlace> _places = [
-    DemoPlace(id: '1', name: 'Sample Store', latitude: 12.9716, longitude: 77.5946),
-    DemoPlace(id: '2', name: 'Corner Cafe', latitude: 12.9784, longitude: 77.6408),
-    DemoPlace(id: '3', name: 'City Market', latitude: 12.9698, longitude: 77.5750),
-  ];
-
-  /// Point picked by the last map tap, shown as a draggable pin.
+  /// Dropped by tapping empty map, and the one selection mode that survives
+  /// every other one. This is how a location is chosen by hand — and it is the
+  /// same gesture a store owner would use to place a new listing.
   LatLng? _pickedPoint;
-  DemoPlace? _selectedPlace;
+
+  /// Current sheet contents. Only one is ever visible.
+  _SheetMode _sheetMode = _SheetMode.discovery;
+
+  // Base layer / overlays, kept so the layers sheet stays meaningful.
+  // Defaults to the key-less OSM standard style: CARTO and MapTiler endpoints
+  // return a flat "API key required" placeholder tile without a key.
+  String _baseLayerId = MapBaseLayer.defaultLayerId;
+  final Set<MapOverlay> _overlays = {};
+
+  // Route target, used by the transport sheet.
+  LatLng? _routeDestination;
+  String _routeDestinationLabel = '';
+
+  /// Increments when the map moves, so marker work can be skipped until idle.
+  bool _mapBusy = false;
+
+  // ------------------------------------------------------- inline search state
+
+  static const _searchDebounceDelay = Duration(milliseconds: 420);
+  final FocusNode _searchFocus = FocusNode();
+  Timer? _searchDebounce;
+  int _searchRequestId = 0;
+
+  /// True while the top bar is a live text field. The bar never moves; only its
+  /// contents swap, so the keyboard cannot shift the map's chrome.
+  bool _searchActive = false;
+  List<SearchResult> _searchResults = const [];
+  bool _searchLoading = false;
+  String? _searchError;
+
+  bool get _searchPanelOpen =>
+      _searchActive &&
+      (_searchResults.isNotEmpty || _searchError != null || _searchLoading);
+
+  // ----------------------------------------------------------------- helpers
+
+  MapBaseLayer get _baseLayer => MapBaseLayer.byId(_baseLayerId);
+
+  List<Place> get _visiblePlaces => SampleData.filter(_activeCategory);
+
+  LatLng get _userPoint =>
+      _myLocation?.point ?? const LatLng(12.9716, 77.5946);
+
+  @override
+  void initState() {
+    super.initState();
+    // A marker tap or category change should collapse the sheet back to its
+    // minimum so the card never covers the thing it describes.
+    _sheetController.addListener(_onSheetScroll);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _locating = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) => locateMe());
+  }
+
+  @override
+  void dispose() {
+    _searchDebounce?.cancel();
+    _searchFocus.dispose();
+    _geocoding.dispose();
+    _searchController.dispose();
+    _sheetController.dispose();
+    super.dispose();
+  }
+
+  void _onSheetScroll() {
+    if (!_sheetController.isAttached) return;
+    final size = _sheetController.size;
+    // Below ~25% the sheet is showing only its handle: treat that as "dismissed
+    // enough that the map should breathe" and reset to the discovery prompt.
+    if (size < 0.25 && _sheetMode != _SheetMode.discovery) {
+      setState(() {
+        _sheetMode = _SheetMode.discovery;
+        _selectedPlace = null;
+        _routeDestination = null;
+      });
+    }
+  }
+
+  // -------------------------------------------------------------- my location
+
+  Future<void> locateMe() async {
+    if (_locating) return;
+    setState(() => _locating = true);
+    final messenger = ScaffoldMessenger.of(context);
+
+    Future<void> fail(String message) async {
+      if (!mounted) return;
+      setState(() {
+        _locating = false;
+        _statusMessage = message;
+      });
+      messenger.showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 3)),
+      );
+    }
+
+    if (!await _location.isServiceEnabled()) {
+      await fail('Location is switched off on this device.');
+      return;
+    }
+    if (!await _location.hasPermission()) {
+      if (!await _location.requestPermission()) {
+        await fail('RevMap needs location access to show where you are.');
+        return;
+      }
+    }
+
+    final result = await _location.getCurrentLocation();
+    if (!mounted) return;
+    if (result.isSuccess) {
+      setState(() {
+        _myLocation = result.location;
+        _locating = false;
+        _statusMessage = null;
+      });
+      _mapController.move(result.location!.point, 15);
+    } else {
+      await fail(switch (result.failure) {
+        LocationFailure.timeout => 'Timed out getting a location fix.',
+        LocationFailure.serviceDisabled => 'Location is switched off.',
+        LocationFailure.permissionDenied => 'Location permission denied.',
+        _ => result.message ?? 'Could not determine your location.',
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------ markers
+
+  void _selectPlace(Place place) {
+    setState(() {
+      _selectedPlace = place;
+      _sheetMode = _SheetMode.place;
+      _activeCategory = null;
+      // One selection at a time: a place supersedes a hand-picked point.
+      _pickedPoint = null;
+    });
+    _mapController.move(place.point, 16);
+    _expandSheet();
+  }
+
+  void _onCategorySelected(PlaceCategory? category) {
+    setState(() {
+      _activeCategory = category;
+      _selectedPlace = null;
+      if (category == null) {
+        _sheetMode = _SheetMode.discovery;
+      }
+    });
+    if (category != null) {
+      // Frame the whole filtered set so nothing is stranded off-screen.
+      final points = _visiblePlaces.map((p) => p.point).toList();
+      if (points.isNotEmpty) {
+        _mapController.fitCamera(
+          CameraFit.coordinates(
+            coordinates: points,
+            padding: const EdgeInsets.fromLTRB(56, 180, 56, 320),
+            maxZoom: 15,
+          ),
+        );
+      }
+      setState(() => _sheetMode = _SheetMode.discovery);
+      _expandSheet();
+    }
+  }
+
+  void _expandSheet() {
+    if (!_sheetController.isAttached) return;
+    _sheetController.animateTo(
+      0.55,
+      duration: const Duration(milliseconds: 280),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  // ------------------------------------------------------------------- search
+
+  /// Activates the inline search field. The bar stays exactly where it is — no
+  /// sheet, no repositioning — and results drop in beneath it over the map.
+  void _activateSearch() {
+    setState(() {
+      _searchActive = true;
+      _activeCategory = null;
+    });
+  }
+
+  void _deactivateSearch() {
+    _searchDebounce?.cancel();
+    setState(() {
+      _searchActive = false;
+      _searchResults = const [];
+      _searchError = null;
+      _searchLoading = false;
+    });
+    _searchController.clear();
+    _searchFocus.unfocus();
+  }
+
+  void _clearSearch() {
+    _searchDebounce?.cancel();
+    _searchController.clear();
+    setState(() {
+      _searchResults = const [];
+      _searchError = null;
+      _searchLoading = false;
+    });
+  }
+
+  /// Debounced keystroke handler. The geocoding service applies its own
+  /// rate limit; this just avoids firing a request per character.
+  void _onSearchChanged(String value) {
+    _searchDebounce?.cancel();
+    final term = value.trim();
+    if (term.length < 2) {
+      setState(() {
+        _searchResults = const [];
+        _searchError = null;
+        _searchLoading = false;
+      });
+      return;
+    }
+    setState(() => _searchLoading = true);
+    _searchDebounce =
+        Timer(_searchDebounceDelay, () => _runSearch(term));
+  }
+
+  Future<void> _runSearch(String term) async {
+    final id = ++_searchRequestId;
+    try {
+      final results = await _geocoding.search(term, near: _myLocation?.point);
+      // A newer keystroke already started a search; drop this stale answer.
+      if (!mounted || id != _searchRequestId) return;
+      setState(() {
+        _searchResults = results;
+        _searchError =
+            results.isEmpty ? 'No places matched "$term".' : null;
+        _searchLoading = false;
+      });
+    } on GeocodingException catch (e) {
+      if (!mounted || id != _searchRequestId) return;
+      setState(() {
+        _searchError = e.message;
+        _searchResults = const [];
+        _searchLoading = false;
+      });
+    }
+  }
+
+  /// A geocoding result was chosen: centre on it and plan a route.
+  void _onSearchResult(SearchResult result) {
+    _searchDebounce?.cancel();
+    setState(() {
+      _searchActive = false;
+      _searchResults = const [];
+      _searchController.clear();
+      _searchFocus.unfocus();
+      _activeCategory = null;
+      _selectedPlace = null;
+      _pickedPoint = null;
+      _routeDestination = result.point;
+      _routeDestinationLabel = result.title;
+      _sheetMode = _SheetMode.transport;
+    });
+    _mapController.move(result.point, 15);
+    _expandSheet();
+  }
+
+  void _quickSearch(String term) {
+    _searchController
+      ..text = term
+      ..selection = TextSelection.collapsed(offset: term.length);
+    setState(() => _searchActive = true);
+    // Run immediately: the term is already complete, so no debounce needed.
+    _searchDebounce?.cancel();
+    _runSearch(term);
+  }
+
+  // ------------------------------------------------------------------ actions
+
+  void _onPlaceAction(PlaceAction action) {
+    final place = _selectedPlace;
+    if (place == null) return;
+    switch (action) {
+      case PlaceAction.directions:
+        setState(() {
+          _routeDestination = place.point;
+          _routeDestinationLabel = place.name;
+          _sheetMode = _SheetMode.transport;
+        });
+        _mapController.move(place.point, 15);
+        _expandSheet();
+      case PlaceAction.tickets:
+        _toast('Tickets are not wired up yet.');
+      case PlaceAction.details:
+        _toast('Full details are not wired up yet.');
+      case PlaceAction.reviews:
+        _toast('Reviews arrive with the backend.');
+    }
+  }
+
+  void _toast(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  // ------------------------------------------------------------------- layers
+
+  Future<void> _openLayers() async {
+    final selection = await showMapLayersSheet(
+      context: context,
+      currentBaseLayerId: _baseLayerId,
+      currentOverlays: _overlays,
+    );
+    if (selection == null || !mounted) return;
+    setState(() {
+      _baseLayerId = selection.baseLayerId;
+      _overlays
+        ..clear()
+        ..addAll(selection.enabledOverlays);
+    });
+  }
+
+  // --------------------------------------------------------------------- zoom
+
+  void _zoomBy(double delta) {
+    final camera = _mapController.camera;
+    _mapController.move(camera.center, (camera.zoom + delta).clamp(2, 19));
+  }
+
+  // ------------------------------------------------------------------- build
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('RevMap')),
-      body: FlutterMap(
-        mapController: _mapController,
-        options: MapOptions(
-          initialCenter: _initialCenter,
-          initialZoom: _initialZoom,
-          minZoom: 2,
-          maxZoom: 19,
-          backgroundColor: const Color(0xFFE8E3DC),
-          onTap: (_, point) => setState(() {
-            _pickedPoint = point;
-            _selectedPlace = null;
-          }),
-        ),
+      // No app bar: the map owns the full screen.
+      extendBodyBehindAppBar: true,
+      body: Stack(
         children: [
-          TileLayer(
-            urlTemplate: _tileUrlTemplate,
-            userAgentPackageName: _userAgentPackageName,
-          ),
-          MarkerLayer(
-            markers: [
-              for (final place in _places)
-                Marker(
-                  key: ValueKey(place.id),
-                  point: place.point,
-                  width: 44,
-                  height: 44,
-                  child: GestureDetector(
-                    onTap: () => setState(() {
-                      _selectedPlace = place;
-                      _pickedPoint = null;
-                    }),
-                    child: _PlacePin(isSelected: place == _selectedPlace),
+          // ---- 1. the map, the dominant element -------------------------
+          Positioned.fill(
+            child: FlutterMap(
+              mapController: _mapController,
+              options: MapOptions(
+                initialCenter: const LatLng(12.9716, 77.5946),
+                initialZoom: 13,
+                minZoom: 2,
+                maxZoom: 19,
+                backgroundColor: AppTokens.mapLand,
+                onMapEvent: (event) {
+                  if (event is MapEventMoveStart && !_mapBusy) {
+                    setState(() => _mapBusy = true);
+                  } else if (event is MapEventMoveEnd && _mapBusy) {
+                    setState(() => _mapBusy = false);
+                  }
+                },
+                onTap: (_, point) {
+                  // Tapping the map drops a pin there. This supersedes a place
+                  // selection but deliberately survives category filtering and
+                  // a dismissed card, so a hand-picked point is never lost by
+                  // an unrelated interaction.
+                  setState(() {
+                    _pickedPoint = point;
+                    _selectedPlace = null;
+                    _sheetMode = _SheetMode.picked;
+                  });
+                },
+              ),
+              children: [
+                TileLayer(
+                  urlTemplate: _baseLayer.urlTemplate,
+                  subdomains: _baseLayer.subdomains,
+                  userAgentPackageName: 'com.revmap.revamp',
+                  maxNativeZoom: _baseLayer.maxZoom.round(),
+                ),
+                // Accuracy halo sits beneath the markers.
+                if (_myLocation?.accuracy != null)
+                  CircleLayer(
+                    circles: [
+                      CircleMarker(
+                        point: _myLocation!.point,
+                        radius: _myLocation!.accuracy!,
+                        useRadiusInMeter: true,
+                        color: AppTokens.accent.withValues(alpha: 0.10),
+                        borderColor: AppTokens.accent.withValues(alpha: 0.30),
+                        borderStrokeWidth: 1,
+                      ),
+                    ],
+                  ),
+                MarkerLayer(
+                  markers: [
+                    for (final place in _visiblePlaces)
+                      Marker(
+                        key: ValueKey(place.id),
+                        point: place.point,
+                        width: 54,
+                        height: 54,
+                        alignment: Alignment.center,
+                        child: PlaceMarker(
+                          category: place.category,
+                          isSelected: _selectedPlace?.id == place.id,
+                          onTap: () => _selectPlace(place),
+                        ),
+                      ),
+                    if (_myLocation != null)
+                      Marker(
+                        point: _myLocation!.point,
+                        width: 28,
+                        height: 28,
+                        child: const MyLocationDot(),
+                      ),
+                    // The hand-picked point reads as a crosshair, so it never
+                    // gets confused with a place pin or the route pin.
+                    if (_pickedPoint != null)
+                      Marker(
+                        key: const ValueKey('picked-point'),
+                        point: _pickedPoint!,
+                        width: 48,
+                        height: 48,
+                        child: GestureDetector(
+                          onTap: () {
+                            setState(() => _sheetMode = _SheetMode.picked);
+                            _expandSheet();
+                          },
+                          child: PickedPointPin(
+                            selected: _sheetMode == _SheetMode.picked,
+                          ),
+                        ),
+                      ),
+                    if (_routeDestination != null)
+                      Marker(
+                        point: _routeDestination!,
+                        width: 44,
+                        height: 44,
+                        child: const DestinationPin(),
+                      ),
+                  ],
+                ),
+                // Attribution is legally required, but the full string is far
+                // too wide for a phone. Collapse it to the bare source name and
+                // wrap the whole widget so a tap reveals the full text.
+                GestureDetector(
+                  onTap: () => _toast(_baseLayer.attribution),
+                  child: SimpleAttributionWidget(
+                    source: Text(
+                      _shortAttribution(_baseLayer.attribution),
+                      style: const TextStyle(fontSize: 10),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
                   ),
                 ),
-              if (_pickedPoint != null)
-                Marker(
-                  point: _pickedPoint!,
-                  width: 44,
-                  height: 44,
-                  child: const _PlacePin(isSelected: true),
+              ],
+            ),
+          ),
+
+          // ---- 2. floating search + results + category pills -----------
+          Positioned(
+            top: MediaQuery.paddingOf(context).top + AppTokens.s8,
+            left: AppTokens.gutter,
+            right: AppTokens.gutter,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                FloatingSearchBar(
+                  isActive: _searchActive,
+                  controller: _searchController,
+                  focusNode: _searchFocus,
+                  onTap: _activateSearch,
+                  onChanged: _onSearchChanged,
+                  onClear: _clearSearch,
+                  onSubmitted: (_) {
+                    if (_searchResults.isNotEmpty) {
+                      _onSearchResult(_searchResults.first);
+                    }
+                  },
+                  trailing: _searchActive
+                      ? MapControlButton(
+                          icon: Icons.close_rounded,
+                          tooltip: 'Cancel search',
+                          onPressed: _deactivateSearch,
+                        )
+                      : null,
+                ),
+                // Results land directly under the bar, over the map, so the
+                // search control itself never moves.
+                if (_searchPanelOpen) ...[
+                  const SizedBox(height: AppTokens.s8),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 320),
+                    child: SearchPanel(
+                      geocoding: _geocoding,
+                      controller: _searchController,
+                      showField: false,
+                      near: _myLocation?.point,
+                      onResultSelected: _onSearchResult,
+                    ),
+                  ),
+                ] else
+                  const SizedBox(height: AppTokens.s12),
+                CategoryPills(
+                  categories: SampleData.categories,
+                  selected: _activeCategory,
+                  onSelected: _onCategorySelected,
+                ),
+              ],
+            ),
+          ),
+
+          // ---- 3. floating map controls --------------------------------
+          Positioned(
+            right: AppTokens.gutter,
+            // Sit just above the collapsed sheet.
+            bottom: _sheetPeek() + AppTokens.s12,
+            child: MapControlStack(
+              children: [
+                MapControlButton(
+                  icon: Icons.layers_rounded,
+                  tooltip: 'Map layers',
+                  onPressed: _openLayers,
+                ),
+                MapControlButton(
+                  icon: _locating
+                      ? Icons.location_searching_rounded
+                      : Icons.my_location_rounded,
+                  tooltip: 'My location',
+                  isActive: _myLocation != null,
+                  onPressed: _locating ? () {} : locateMe,
+                ),
+                MapControlButton(
+                  icon: Icons.add_rounded,
+                  tooltip: 'Zoom in',
+                  onPressed: () => _zoomBy(1),
+                ),
+                MapControlButton(
+                  icon: Icons.remove_rounded,
+                  tooltip: 'Zoom out',
+                  onPressed: () => _zoomBy(-1),
+                ),
+              ],
+            ),
+          ),
+
+          // ---- 4. the draggable bottom sheet ---------------------------
+          _buildSheet(),
+        ],
+      ),
+    );
+  }
+
+  /// Shrinks a long attribution string to its source name, e.g.
+  /// "© OpenStreetMap contributors, © CARTO" -> "OSM / CARTO".
+  ///
+  /// The full string stays available on tap; this only exists so the required
+  /// attribution fits a narrow screen instead of overflowing it.
+  static String _shortAttribution(String attribution) {
+    final cleaned = attribution
+        .replaceAll('©', '')
+        .replaceAll('OpenStreetMap contributors', 'OSM')
+        .trim();
+    if (cleaned.length <= 22) return cleaned;
+    return '${cleaned.substring(0, 21)}…';
+  }
+
+  /// How much of the screen the collapsed sheet occupies, so the floating
+  /// controls can sit just above it.
+  double _sheetPeek() {
+    final size = _sheetController.isAttached ? _sheetController.size : 0.12;
+    return MediaQuery.sizeOf(context).height * size.clamp(0.0, 1.0);
+  }
+
+  Widget _buildSheet() {
+    return DraggableScrollableSheet(
+      controller: _sheetController,
+      // Collapsed: a peek. Expanded: nearly the full screen.
+      minChildSize: 0.12,
+      initialChildSize: 0.12,
+      maxChildSize: 0.92,
+      snap: true,
+      snapSizes: const [0.12, 0.4, 0.62, 0.92],
+      builder: (context, scrollController) {
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            color: AppTokens.background,
+            borderRadius: const BorderRadius.vertical(
+              top: Radius.circular(AppTokens.radiusSheet),
+            ),
+            boxShadow: AppTokens.floatShadow,
+          ),
+          child: ClipRRect(
+            borderRadius: const BorderRadius.vertical(
+              top: Radius.circular(AppTokens.radiusSheet),
+            ),
+            child: ListView(
+              controller: scrollController,
+              padding: EdgeInsets.zero,
+              children: [
+                Center(child: AppTokens.grabber),
+                switch (_sheetMode) {
+                  _SheetMode.discovery => _DiscoverySheet(
+                      onCategory: _onCategorySelected,
+                      onSearch: _activateSearch,
+                      onQuickSearch: _quickSearch,
+                      status: _statusMessage,
+                    ),
+                  _SheetMode.place => _buildPlaceSheet(),
+                  _SheetMode.picked => _buildPickedSheet(),
+                  _SheetMode.transport => _buildTransportSheet(),
+                },
+                SizedBox(height: MediaQuery.paddingOf(context).bottom),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildPlaceSheet() {
+    final place = _selectedPlace;
+    if (place == null) {
+      return const SizedBox.shrink();
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        PlaceCard(
+          place: place,
+          distanceLabel: place.distanceLabelFrom(_userPoint),
+          onAction: _onPlaceAction,
+          onClose: () => setState(() {
+            _selectedPlace = null;
+            _sheetMode = _SheetMode.discovery;
+          }),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPickedSheet() {
+    final point = _pickedPoint;
+    if (point == null) return const SizedBox.shrink();
+    return _PickedPointSheet(
+      point: point,
+      distanceLabel: _myLocation == null
+          ? null
+          : 'You are ${_formatDistance(_haversineKm(_myLocation!.point, point))} away',
+      onRoute: () => setState(() {
+        _routeDestination = point;
+        _routeDestinationLabel = 'Pinned location';
+        _sheetMode = _SheetMode.transport;
+      }),
+      onCopy: () {
+        Clipboard.setData(ClipboardData(
+          text: '${point.latitude}, ${point.longitude}',
+        ));
+        _toast('Coordinates copied');
+      },
+      onClear: () => setState(() {
+        _pickedPoint = null;
+        _sheetMode = _SheetMode.discovery;
+      }),
+    );
+  }
+
+  /// Great-circle distance in kilometres. Straight-line, not a route length.
+  static double _haversineKm(LatLng a, LatLng b) {
+    const earthKm = 6371.0;
+    double rad(double d) => math.pi / 180.0 * d;
+    final dLat = rad(b.latitude - a.latitude);
+    final dLon = rad(b.longitude - a.longitude);
+    final h = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(rad(a.latitude)) *
+            math.cos(rad(b.latitude)) *
+            math.sin(dLon / 2) *
+            math.sin(dLon / 2);
+    return earthKm * 2 * math.asin(math.min(1.0, math.sqrt(h)));
+  }
+
+  static String _formatDistance(double km) {
+    final m = km * 1000;
+    if (m < 950) return '${m.round()} m';
+    return '${km.toStringAsFixed(1)} km';
+  }
+
+  Widget _buildTransportSheet() {
+    final dest = _routeDestinationLabel.isEmpty
+        ? 'Selected place'
+        : _routeDestinationLabel;
+    return TransportSheet(
+      origin: 'Your location',
+      destination: dest,
+      routes: TransportSheet.sampleRoutes(),
+    );
+  }
+}
+
+/// Sheet content for a point the user tapped on the map.
+///
+/// Deliberately terse: the coordinates are the fact, and the two useful moves
+/// are "route here" and "copy". This is also the gesture a store owner will use
+/// to place a listing, so the coordinates must be readable at a glance.
+class _PickedPointSheet extends StatelessWidget {
+  const _PickedPointSheet({
+    required this.point,
+    this.distanceLabel,
+    this.onRoute,
+    this.onCopy,
+    this.onClear,
+  });
+
+  final LatLng point;
+  final String? distanceLabel;
+  final VoidCallback? onRoute;
+  final VoidCallback? onCopy;
+  final VoidCallback? onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        AppTokens.gutter,
+        AppTokens.s8,
+        AppTokens.gutter,
+        AppTokens.s16,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: AppTokens.accentSoft,
+                  borderRadius: BorderRadius.circular(AppTokens.radiusButton),
+                ),
+                child: const Icon(Icons.add_location_alt_rounded,
+                    size: 21, color: AppTokens.accent),
+              ),
+              const SizedBox(width: AppTokens.s12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Picked location', style: AppTokens.titleSm),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${point.latitude.toStringAsFixed(5)}, '
+                      '${point.longitude.toStringAsFixed(5)}',
+                      style: AppTokens.metadata,
+                    ),
+                  ],
+                ),
+              ),
+              if (onClear != null)
+                IconButton(
+                  tooltip: 'Clear pin',
+                  onPressed: onClear,
+                  icon: const Icon(Icons.close_rounded,
+                      size: 20, color: AppTokens.textMuted),
                 ),
             ],
           ),
-          SimpleAttributionWidget(
-            source: const Text('OpenStreetMap contributors'),
+          if (distanceLabel != null) ...[
+            const SizedBox(height: AppTokens.s12),
+            Row(
+              children: [
+                const Icon(Icons.near_me_rounded,
+                    size: 15, color: AppTokens.textMuted),
+                const SizedBox(width: 6),
+                Text(distanceLabel!, style: AppTokens.caption),
+              ],
+            ),
+          ],
+          const SizedBox(height: AppTokens.s16),
+          Row(
+            children: [
+              Expanded(
+                child: _PickedAction(
+                  label: 'Directions',
+                  icon: Icons.directions_rounded,
+                  primary: true,
+                  onTap: onRoute,
+                ),
+              ),
+              const SizedBox(width: AppTokens.s8),
+              Expanded(
+                child: _PickedAction(
+                  label: 'Copy',
+                  icon: Icons.copy_rounded,
+                  onTap: onCopy,
+                ),
+              ),
+            ],
           ),
         ],
-      ),
-      floatingActionButton: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          FloatingActionButton.small(
-            heroTag: 'zoom_in',
-            tooltip: 'Zoom in',
-            onPressed: () => _mapController.move(
-              _mapController.camera.center,
-              _mapController.camera.zoom + 1,
-            ),
-            child: const Icon(Icons.add),
-          ),
-          const SizedBox(height: 8),
-          FloatingActionButton.small(
-            heroTag: 'zoom_out',
-            tooltip: 'Zoom out',
-            onPressed: () => _mapController.move(
-              _mapController.camera.center,
-              _mapController.camera.zoom - 1,
-            ),
-            child: const Icon(Icons.remove),
-          ),
-        ],
-      ),
-      bottomNavigationBar: _StatusBar(
-        selectedPlace: _selectedPlace,
-        pickedPoint: _pickedPoint,
       ),
     );
   }
 }
 
-class _PlacePin extends StatelessWidget {
-  const _PlacePin({required this.isSelected});
+class _PickedAction extends StatelessWidget {
+  const _PickedAction({
+    required this.label,
+    required this.icon,
+    this.onTap,
+    this.primary = false,
+  });
 
-  final bool isSelected;
+  final String label;
+  final IconData icon;
+  final VoidCallback? onTap;
+  final bool primary;
 
   @override
   Widget build(BuildContext context) {
-    final color = isSelected ? Colors.deepPurple : Colors.redAccent;
-    return Icon(Icons.storefront, color: color, size: isSelected ? 36 : 30);
+    return Material(
+      color: primary ? AppTokens.accent : AppTokens.surfaceMuted,
+      borderRadius: BorderRadius.circular(AppTokens.radiusButton),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(AppTokens.radiusButton),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon,
+                  size: 19,
+                  color: primary ? Colors.white : AppTokens.textSecondary),
+              const SizedBox(width: 7),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: primary ? Colors.white : AppTokens.textPrimary,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 
-/// Shows either the tapped place or the coordinates picked for a new listing.
-class _StatusBar extends StatelessWidget {
-  const _StatusBar({required this.selectedPlace, required this.pickedPoint});
+/// The default bottom-sheet content: the exploratory prompt.
+class _DiscoverySheet extends StatelessWidget {
+  const _DiscoverySheet({
+    required this.onCategory,
+    required this.onSearch,
+    required this.onQuickSearch,
+    this.status,
+  });
 
-  final DemoPlace? selectedPlace;
-  final LatLng? pickedPoint;
+  final ValueChanged<PlaceCategory?> onCategory;
+  final VoidCallback onSearch;
+  final ValueChanged<String> onQuickSearch;
+  final String? status;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final String message;
-    if (selectedPlace != null) {
-      message = '${selectedPlace!.name}  •  '
-          '${selectedPlace!.latitude.toStringAsFixed(5)}, '
-          '${selectedPlace!.longitude.toStringAsFixed(5)}';
-    } else if (pickedPoint != null) {
-      message = 'New place at '
-          '${pickedPoint!.latitude.toStringAsFixed(5)}, '
-          '${pickedPoint!.longitude.toStringAsFixed(5)}';
-    } else {
-      message = 'Tap the map to pick a location, tap a pin for details';
-    }
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        AppTokens.gutter,
+        AppTokens.s8,
+        AppTokens.gutter,
+        AppTokens.s16,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('Explore nearby', style: AppTokens.titleMd),
+          const SizedBox(height: 4),
+          Text(
+            status ?? 'Search, or pick a category to see it on the map.',
+            style: AppTokens.caption,
+          ),
+          const SizedBox(height: AppTokens.s16),
+          // Horizontal row of small image cards, each a discovery entry point.
+          // A horizontally-scrolling view still needs a bounded height, so the
+          // tile is given one — but its own content is what decides the inner
+          // layout, so a longer label or a larger text scale wraps rather than
+          // overflowing.
+          SizedBox(
+            height: 148,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: EdgeInsets.zero,
+              children: [
+                for (final c in SampleData.categories)
+                  Padding(
+                    padding: const EdgeInsets.only(right: AppTokens.s12),
+                    child: _CategoryTile(
+                      category: c,
+                      count: SampleData.filter(c).length,
+                      onTap: () => onCategory(c),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: AppTokens.s20),
+          Text('Popular searches', style: AppTokens.titleSm),
+          const SizedBox(height: AppTokens.s12),
+          Wrap(
+            spacing: AppTokens.s8,
+            runSpacing: AppTokens.s8,
+            children: [
+              for (final term in const ['Coffee', 'Parks', 'Museums', 'Shopping'])
+                _SuggestionChip(label: term, onTap: () => onQuickSearch(term)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
 
-    return SafeArea(
+class _CategoryTile extends StatelessWidget {
+  const _CategoryTile({
+    required this.category,
+    required this.count,
+    required this.onTap,
+  });
+
+  final PlaceCategory category;
+  final int count;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
       child: Container(
-        width: double.infinity,
-        color: theme.colorScheme.surface,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        child: Text(message, style: theme.textTheme.bodyMedium),
+        width: 92,
+        // Height is decided by the content rather than fixed, so a longer
+        // category name or a larger text scale cannot overflow the card.
+        padding: const EdgeInsets.all(AppTokens.s12),
+        decoration: BoxDecoration(
+          color: AppTokens.surfaceMuted,
+          borderRadius: BorderRadius.circular(AppTokens.radiusCard),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(category.icon, size: 22, color: category.tint),
+            const SizedBox(height: AppTokens.s12),
+            Text(
+              category.label,
+              style: AppTokens.titleSm.copyWith(fontSize: 13.5),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 2),
+            Text('$count nearby', style: AppTokens.metadata),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SuggestionChip extends StatelessWidget {
+  const _SuggestionChip({required this.label, required this.onTap});
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppTokens.surfaceMuted,
+      borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          child: Text(
+            label,
+            style: AppTokens.caption.copyWith(
+              fontWeight: FontWeight.w600,
+              color: AppTokens.textPrimary,
+            ),
+          ),
+        ),
       ),
     );
   }

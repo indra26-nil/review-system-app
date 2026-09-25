@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'map_screen.dart';
+import 'theme/app_theme.dart';
 
 void main() {
   runApp(const RevMapApp());
@@ -14,10 +15,7 @@ class RevMapApp extends StatelessWidget {
     return MaterialApp(
       title: 'RevMap',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-        useMaterial3: true,
-      ),
+      theme: RevMapTheme.light(),
       home: const MapScreen(),
     );
   }

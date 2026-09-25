@@ -36,6 +36,9 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_map: ^8.3.2
   latlong2: ^0.10.1
+  # Place search (Nominatim / OpenStreetMap). Already present as a transitive
+  # dependency of flutter_map, so this does not add a new download.
+  http: ^1.6.0
 
 dev_dependencies:
   flutter_test:

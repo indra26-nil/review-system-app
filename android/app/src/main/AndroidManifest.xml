@@ -1,6 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Required to load the OpenStreetMap map tiles on release builds. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Place search hits the Nominatim geocoding API. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- "My location": centre the map on the phone's current GPS fix. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <!-- GPS is preferred but not required: the app falls back to the network
+         provider, so a device without GPS hardware can still be located. -->
+    <uses-feature android:name="android.hardware.location.gps" android:required="false"/>
 
     <application
         android:label="revamp"
