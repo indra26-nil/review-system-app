@@ -64,7 +64,7 @@ class _FloatingSearchBarState extends State<FloatingSearchBar> {
                   size: 23,
                   color: AppTokens.textSecondary,
                 ),
-                const SizedBox(width: AppTokens.s12),
+                const SizedBox(width: AppTokens.s16),
                 Expanded(
                   child: widget.isActive
                       ? TextField(
@@ -74,7 +74,7 @@ class _FloatingSearchBarState extends State<FloatingSearchBar> {
                           textInputAction: TextInputAction.search,
                           onChanged: widget.onChanged,
                           onSubmitted: widget.onSubmitted,
-                          style: AppTokens.body.copyWith(fontSize: 16),
+                          style: AppTokens.body.copyWith(fontSize: 17),
                           cursorColor: AppTokens.accent,
                           decoration: const InputDecoration(
                             hintText: 'Search places, addresses…',
@@ -83,7 +83,7 @@ class _FloatingSearchBarState extends State<FloatingSearchBar> {
                             contentPadding: EdgeInsets.zero,
                             hintStyle: TextStyle(
                               color: AppTokens.textMuted,
-                              fontSize: 16,
+                              fontSize: 17,
                             ),
                           ),
                         )
@@ -97,7 +97,7 @@ class _FloatingSearchBarState extends State<FloatingSearchBar> {
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: AppTokens.body.copyWith(
-                                fontSize: 16,
+                                fontSize: 17,
                                 color: AppTokens.textMuted,
                               ),
                             ),
@@ -112,7 +112,7 @@ class _FloatingSearchBarState extends State<FloatingSearchBar> {
                       padding: EdgeInsets.only(left: AppTokens.s8),
                       child: Icon(
                         Icons.cancel_rounded,
-                        size: 22,
+                        size: 25,
                         color: AppTokens.textMuted,
                       ),
                     ),
@@ -165,7 +165,7 @@ class CategoryPills extends StatelessWidget {
             onTap: () => onSelected(isOn ? null : c),
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 160),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 2),
               alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: isOn ? AppTokens.accent : AppTokens.background,
@@ -177,14 +177,14 @@ class CategoryPills extends StatelessWidget {
                 children: [
                   Icon(
                     c.icon,
-                    size: 18,
+                    size: 20,
                     color: isOn ? Colors.white : c.tint,
                   ),
                   const SizedBox(width: 6),
                   Text(
                     c.label,
                     style: TextStyle(
-                      fontSize: 14.5,
+                      fontSize: 15.5,
                       fontWeight: FontWeight.w600,
                       color: isOn ? Colors.white : AppTokens.textPrimary,
                     ),
@@ -235,7 +235,7 @@ class MapControlButton extends StatelessWidget {
           height: size,
           child: Icon(
             icon,
-            size: 23,
+            size: 26,
             color: isActive ? AppTokens.accent : AppTokens.textPrimary,
           ),
         ),

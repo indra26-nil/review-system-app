@@ -86,11 +86,18 @@ class AppTokens {
   // ------------------------------------------------------- control sizing
 
   /// Sized for comfortable thumb reach, not for a desktop browser.
-  static const double controlSize = 50;
-  static const double searchBarHeight = 58;
-  static const double categoryPillHeight = 46;
+  ///
+  /// These are deliberately generous — an iOS control is a comfortable target
+  /// with its label legible at arm's length, not a hairline that fits more
+  /// controls on screen. [markerSize] is intentionally *not* scaled with them:
+  /// map pins must stay compact so a dense cluster of them remains readable.
+  static const double controlSize = 58;
+  static const double searchBarHeight = 64;
+  static const double categoryPillHeight = 52;
+
+  /// Map pin size. Held constant while the chrome around it grows.
   static const double markerSize = 44;
-  static const double touchTarget = 44;
+  static const double touchTarget = 48;
 
   // ---------------------------------------------------------------- spacing
 

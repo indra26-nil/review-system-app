@@ -17,7 +17,7 @@ import 'widgets/floating_search.dart';
 import 'widgets/map_layers_sheet.dart';
 import 'widgets/place_card.dart';
 import 'widgets/place_marker.dart';
-import 'widgets/search_panel.dart';
+import 'widgets/search_results_panel.dart';
 import 'widgets/transport_sheet.dart';
 
 /// The map screen.
@@ -111,7 +111,8 @@ class _MapScreenState extends State<MapScreen> {
     // A marker tap or category change should collapse the sheet back to its
     // minimum so the card never covers the thing it describes.
     _sheetController.addListener(_onSheetScroll);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _locating = true);
+    // Ask for a position once the first frame is up, so the map controller is
+    // attached before it is moved. locateMe() manages _locating itself.
     WidgetsBinding.instance.addPostFrameCallback((_) => locateMe());
   }
 
@@ -548,15 +549,14 @@ class _MapScreenState extends State<MapScreen> {
                 // search control itself never moves.
                 if (_searchPanelOpen) ...[
                   const SizedBox(height: AppTokens.s8),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 320),
-                    child: SearchPanel(
-                      geocoding: _geocoding,
-                      controller: _searchController,
-                      showField: false,
-                      near: _myLocation?.point,
-                      onResultSelected: _onSearchResult,
-                    ),
+                  // Driven by this screen's own query state. Routing this
+                  // through SearchPanel left the panel searching nothing,
+                  // because the field it listens to is not rendered here.
+                  SearchResultsPanel(
+                    results: _searchResults,
+                    error: _searchError,
+                    loading: _searchLoading,
+                    onResultSelected: _onSearchResult,
                   ),
                 ] else
                   const SizedBox(height: AppTokens.s12),
@@ -887,20 +887,24 @@ class _PickedAction extends StatelessWidget {
         onTap: onTap,
         borderRadius: BorderRadius.circular(AppTokens.radiusButton),
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 14),
+          padding: const EdgeInsets.symmetric(vertical: 17),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(icon,
-                  size: 19,
+                  size: 22,
                   color: primary ? Colors.white : AppTokens.textSecondary),
               const SizedBox(width: 7),
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                  color: primary ? Colors.white : AppTokens.textPrimary,
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: primary ? Colors.white : AppTokens.textPrimary,
+                  ),
                 ),
               ),
             ],

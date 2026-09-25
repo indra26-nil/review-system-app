@@ -6,6 +6,7 @@
 // that a 393x852 screen exposes.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:latlong2/latlong.dart';
@@ -16,6 +17,7 @@ import 'package:revamp/models/place.dart';
 import 'package:revamp/widgets/floating_search.dart';
 import 'package:revamp/widgets/place_card.dart';
 import 'package:revamp/widgets/place_marker.dart';
+import 'package:revamp/widgets/search_results_panel.dart';
 
 /// iPhone 14 Pro logical size — the design targets 375-430 pt widths.
 const _phone = Size(393, 852);
@@ -154,6 +156,120 @@ void main() {
   });
 
 
+  group('search results render from the map query', () {
+    // Regression guard: results used to be rendered by a SearchPanel that
+    // owned its own private state and searched from its own (hidden) field, so
+    // typing in the map's search bar produced an empty panel.
+
+    testWidgets('typing into the bar shows the results panel',
+        (WidgetTester tester) async {
+      await _pumpPhoneApp(tester);
+
+      await tester.tap(find.byType(FloatingSearchBar));
+      await tester.pump();
+      expect(find.byType(SearchResultsPanel), findsNothing);
+
+      await tester.enterText(find.byType(TextField), 'kol');
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // A geocoding call is attempted (it fails offline in tests, which still
+      // proves the panel is driven by the query rather than left inert).
+      expect(find.byType(SearchResultsPanel), findsOneWidget);
+    });
+
+    testWidgets('the results panel reports errors instead of hiding them',
+        (WidgetTester tester) async {
+      await _pumpPhoneApp(tester);
+
+      await tester.tap(find.byType(FloatingSearchBar));
+      await tester.pump();
+      await tester.enterText(find.byType(TextField), 'kol');
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      final panel = tester.widget<SearchResultsPanel>(find.byType(SearchResultsPanel));
+      // Either results or a message, never a silently empty panel.
+      expect(panel.results.isNotEmpty || panel.error != null, isTrue);
+    });
+
+    testWidgets('a single character does not open the panel',
+        (WidgetTester tester) async {
+      await _pumpPhoneApp(tester);
+
+      await tester.tap(find.byType(FloatingSearchBar));
+      await tester.pump();
+      await tester.enterText(find.byType(TextField), 'k');
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // Below the two-character minimum there is nothing worth showing.
+      expect(find.byType(SearchResultsPanel), findsNothing);
+    });
+  });
+
+  group('my location', () {
+    // Regression guard: initState used to set _locating = true *before* calling
+    // locateMe(), so the guard returned early, the flag never cleared, and the
+    // button was permanently disabled. The native channel is mocked here so the
+    // whole path is exercised, including that the locating state is released.
+
+    Future<void> pumpWithLocation(
+      WidgetTester tester, {
+      bool serviceEnabled = true,
+      bool permission = true,
+    }) async {
+      const channel = MethodChannel('com.revamp/location');
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        (call) async => switch (call.method) {
+          'isServiceEnabled' => serviceEnabled,
+          'hasPermission' => permission,
+          'requestPermission' => permission,
+          'getCurrentLocation' => <String, dynamic>{
+              'latitude': 22.9598,
+              'longitude': 88.4473,
+              'accuracy': 100.0,
+              'provider': 'network',
+              'timestamp': DateTime.now().millisecondsSinceEpoch,
+            },
+          _ => null,
+        },
+      );
+      addTearDown(() => tester.binding.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null));
+      await _pumpPhoneApp(tester);
+      await tester.pump(const Duration(milliseconds: 600));
+    }
+
+    testWidgets('a fix is fetched and the locating state is released',
+        (WidgetTester tester) async {
+      await pumpWithLocation(tester);
+
+      // The blue "you are here" dot only appears once a fix lands.
+      expect(find.byType(MyLocationDot), findsOneWidget);
+
+      final button = tester.widget<MapControlButton>(
+        find.widgetWithIcon(MapControlButton, Icons.my_location_rounded),
+      );
+      expect(button.onPressed, isNotNull,
+          reason: 'button must be re-enabled once locating finishes');
+    });
+
+    testWidgets('a blocked service reports it and still releases the button',
+        (WidgetTester tester) async {
+      await pumpWithLocation(tester, serviceEnabled: false);
+
+      expect(find.byType(MyLocationDot), findsNothing);
+
+      final button = tester.widget<MapControlButton>(
+        find.widgetWithIcon(MapControlButton, Icons.my_location_rounded),
+      );
+      expect(button.onPressed, isNotNull,
+          reason: 'a failure must not leave the button stuck disabled');
+    });
+  });
+
   group('picking a location on the map', () {
     // Regression guard: the redesign dropped tap-to-pick entirely, leaving map
     // taps as a no-op unless a place was already selected.
@@ -165,8 +281,9 @@ void main() {
       // Nothing picked to begin with.
       expect(find.byType(PickedPointPin), findsNothing);
 
-      // Tap the middle of the map, away from the floating chrome.
-      await tester.tapAt(tester.getCenter(find.byType(FlutterMap)));
+      // Tap low on the map: the centre happens to sit on a sample place
+      // marker, and tapping a marker correctly selects a place instead.
+      await tester.tapAt(const Offset(196, 620));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 
@@ -180,9 +297,9 @@ void main() {
         (WidgetTester tester) async {
       await _pumpPhoneApp(tester);
 
-      await tester.tapAt(tester.getCenter(find.byType(FlutterMap)));
+      await tester.tapAt(const Offset(196, 620));
       await tester.pump(const Duration(milliseconds: 400));
-      await tester.tapAt(tester.getCenter(find.byType(FlutterMap)));
+      await tester.tapAt(const Offset(196, 560));
       await tester.pump(const Duration(milliseconds: 400));
 
       // Exactly one pin, never a stack of them.
@@ -193,7 +310,7 @@ void main() {
         (WidgetTester tester) async {
       await _pumpPhoneApp(tester);
 
-      await tester.tapAt(tester.getCenter(find.byType(FlutterMap)));
+      await tester.tapAt(const Offset(196, 620));
       await tester.pump(const Duration(milliseconds: 400));
       expect(find.byType(PickedPointPin), findsOneWidget);
 

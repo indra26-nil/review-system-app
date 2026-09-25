@@ -262,11 +262,11 @@ class _PrimaryAction extends StatelessWidget {
         onTap: onTap,
         borderRadius: BorderRadius.circular(AppTokens.radiusButton),
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 13),
+          padding: const EdgeInsets.symmetric(vertical: 16),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 19, color: Colors.white),
+              Icon(icon, size: 21, color: Colors.white),
               const SizedBox(width: 7),
               Flexible(
                 child: Text(
@@ -303,11 +303,11 @@ class _PillAction extends StatelessWidget {
         onTap: onTap,
         borderRadius: BorderRadius.circular(AppTokens.radiusButton),
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 13),
+          padding: const EdgeInsets.symmetric(vertical: 16),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 17, color: AppTokens.textSecondary),
+              Icon(icon, size: 20, color: AppTokens.textSecondary),
               const SizedBox(width: 6),
               Flexible(
                 child: Text(
