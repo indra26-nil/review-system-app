@@ -1,20 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:revamp/main.dart';
+import 'package:revamp/widgets/place_marker.dart';
 
 void main() {
-  testWidgets('hit path at y=500', (WidgetTester tester) async {
-    tester.view.devicePixelRatio = 1.0;
-    tester.view.physicalSize = const Size(393, 852);
-    addTearDown(() { tester.view.resetPhysicalSize(); tester.view.resetDevicePixelRatio(); });
-    await tester.pumpWidget(const RevMapApp());
-    await tester.pump(const Duration(milliseconds: 200));
-    for (final y in [300.0, 500.0, 700.0]) {
-      final res = tester.hitTestOnBinding(Offset(196, y));
-      final types = res.path.map((e) => e.target.runtimeType.toString()).toList();
-      debugPrint('y=$y PATH: ${types.take(6).join(" > ")}');
-      // Show the nearest FlutterMap in the path
-      debugPrint('     hasFlutterMap=${types.any((t) => t.contains("MobileLayer") || t.contains("FlutterMap") || t.contains("Tile"))}');
-    }
+  testWidgets('y=426 selects a place instead of dropping a pin', (t) async {
+    t.view.devicePixelRatio = 1.0;
+    t.view.physicalSize = const Size(393, 852);
+    addTearDown(() { t.view.resetPhysicalSize(); t.view.resetDevicePixelRatio(); });
+    await t.pumpWidget(const RevMapApp());
+    await t.pump(const Duration(milliseconds: 200));
+    debugPrint('markers on screen: ${find.byType(PlaceMarker).evaluate().length}');
+    // Is there a marker right at (196,426)?
+    final hit = t.hitTestOnBinding(const Offset(196, 426));
+    debugPrint('hit top: ${hit.path.first.target.runtimeType}');
+    await t.tapAt(const Offset(196, 426));
+    await t.pump(const Duration(milliseconds: 500));
+    debugPrint('after tap: pin=${find.byType(PickedPointPin).evaluate().length}');
   });
 }
