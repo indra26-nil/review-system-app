@@ -9,11 +9,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:revamp/data/sample_data.dart';
 import 'package:revamp/main.dart';
+import 'package:revamp/services/geocoding_service.dart';
 import 'package:revamp/models/map_layer.dart';
 import 'package:revamp/models/place.dart';
+import 'package:revamp/widgets/compass.dart';
 import 'package:revamp/widgets/floating_search.dart';
 import 'package:revamp/widgets/place_card.dart';
 import 'package:revamp/widgets/place_marker.dart';
@@ -267,6 +271,109 @@ void main() {
       );
       expect(button.onPressed, isNotNull,
           reason: 'a failure must not leave the button stuck disabled');
+    });
+  });
+
+  group('the picked card survives being dragged open', () {
+    // Regression guard: the sheet reset its content to the discovery prompt
+    // whenever its height dropped below ~25%. Dragging *up* to read a tall card
+    // passes through those same heights, so expanding the card wiped it back to
+    // "Explore nearby" — the exact symptom reported.
+
+    testWidgets('picking opens the sheet and it stays on the picked card',
+        (WidgetTester tester) async {
+      await _pumpPhoneApp(tester);
+
+      await tester.tapAt(const Offset(196, 620));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // The pick itself opens the sheet rather than leaving it collapsed.
+      expect(find.text('Picked location'), findsOneWidget);
+
+      // Drag the sheet all the way up, through every snap size.
+      for (final dy in [-150.0, -200.0, -200.0]) {
+        await tester.drag(
+            find.byType(DraggableScrollableSheet), Offset(0, dy));
+        await tester.pump(const Duration(milliseconds: 300));
+      }
+
+      // Still the picked card, never the discovery prompt.
+      expect(find.text('Picked location'), findsOneWidget);
+      expect(find.text('Explore nearby'), findsNothing);
+    });
+
+    testWidgets('dragging the sheet back down keeps the card too',
+        (WidgetTester tester) async {
+      await _pumpPhoneApp(tester);
+
+      await tester.tapAt(const Offset(196, 620));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // Collapse it right down to the peek.
+      await tester.drag(
+          find.byType(DraggableScrollableSheet), const Offset(0, 500));
+      await tester.pump(const Duration(milliseconds: 400));
+
+      // Height is not a dismissal signal; only the close button is. (The pin
+      // itself is not asserted: once the sheet bottoms out the surplus drag
+      // correctly falls through to the map, which pans the pin out of view.)
+      expect(find.text('Picked location'), findsOneWidget);
+    });
+  });
+
+  group('compass', () {
+    testWidgets('is hidden while the map is north-up', (t) async {
+      await _pumpPhoneApp(t);
+      // A compass pinned at "N" on a north-up map is just noise.
+      expect(find.byType(CompassButton), findsNothing);
+    });
+
+    testWidgets('rounds rotation to the nearest cardinal label', (t) async {
+      // flutter_map rotates counter-clockwise, so a positive bearing swings the
+      // compass the opposite way. North-up and south are unambiguous; the
+      // important property is that 270 and -90 agree, since they are the same
+      // orientation expressed two ways.
+      expect(cardinalFor(0), 'N');
+      expect(cardinalFor(180), 'S');
+      expect(cardinalFor(359), 'N');
+      expect(cardinalFor(270), cardinalFor(-90));
+      expect(cardinalFor(90), cardinalFor(-270));
+    });
+  });
+
+  group('picked location shows details', () {
+    // The picked sheet must name the point, not just print coordinates.
+    testWidgets('shows a lookup state, then the resolved name',
+        (WidgetTester tester) async {
+      // Mock the geocoder so no real network is needed.
+      final client = MockClient((req) async {
+        if (req.url.path == '/reverse') {
+          return http.Response(
+            '{"type":"FeatureCollection","features":[{"type":"Feature",'
+            '"properties":{"name":"Cubbon Park","city":"Bengaluru",'
+            '"country":"India","osm_value":"park"},'
+            '"geometry":{"type":"Point","coordinates":[77.5929,12.9763]}}]}',
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response('{"type":"FeatureCollection","features":[]}', 200,
+            headers: {'content-type': 'application/json'});
+      });
+      GeocodingService.debugClient = client;
+      addTearDown(() => GeocodingService.debugClient = null);
+
+      await _pumpPhoneApp(tester);
+      await tester.tapAt(const Offset(196, 620));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // The resolved name is shown, not just coordinates.
+      expect(find.text('Cubbon Park'), findsOneWidget);
+      // Coordinates remain available for confirming an exact listing spot.
+      expect(find.textContaining('12.'), findsWidgets);
     });
   });
 

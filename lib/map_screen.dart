@@ -13,6 +13,7 @@ import 'models/search_result.dart';
 import 'services/geocoding_service.dart';
 import 'services/location_service.dart';
 import 'theme/app_tokens.dart';
+import 'widgets/compass.dart';
 import 'widgets/floating_search.dart';
 import 'widgets/map_layers_sheet.dart';
 import 'widgets/place_card.dart';
@@ -61,6 +62,16 @@ class _MapScreenState extends State<MapScreen> {
   /// every other one. This is how a location is chosen by hand — and it is the
   /// same gesture a store owner would use to place a new listing.
   LatLng? _pickedPoint;
+
+  /// What reverse geocoding says is at [_pickedPoint]. Null means "not looked up
+  /// yet" or "nothing recognisable there", in which case the sheet falls back to
+  /// bare coordinates rather than showing an empty name.
+  SearchResult? _pickedPlaceDetail;
+  bool _pickedDetailLoading = false;
+
+  /// Current map rotation in degrees, kept in state so the compass can reflect
+  /// it and stay hidden while the map is north-up.
+  double _rotation = 0;
 
   /// Current sheet contents. Only one is ever visible.
   _SheetMode _sheetMode = _SheetMode.discovery;
@@ -126,18 +137,16 @@ class _MapScreenState extends State<MapScreen> {
     super.dispose();
   }
 
+  /// Sheet height alone is not a dismissal signal: dragging *up* to read a tall
+  /// card passes through the same small sizes as dragging *down* to dismiss it.
+  /// Inferring intent from height therefore wiped the selection the moment the
+  /// user tried to expand it.
+  ///
+  /// Dismissal is now explicit instead — the close button on each card, or
+  /// tapping empty map — and the sheet springs to a height that actually fits
+  /// its content when a selection is made.
   void _onSheetScroll() {
-    if (!_sheetController.isAttached) return;
-    final size = _sheetController.size;
-    // Below ~25% the sheet is showing only its handle: treat that as "dismissed
-    // enough that the map should breathe" and reset to the discovery prompt.
-    if (size < 0.25 && _sheetMode != _SheetMode.discovery) {
-      setState(() {
-        _sheetMode = _SheetMode.discovery;
-        _selectedPlace = null;
-        _routeDestination = null;
-      });
-    }
+    // Retained only so the controller has a listener; dismissal is explicit.
   }
 
   // -------------------------------------------------------------- my location
@@ -197,6 +206,8 @@ class _MapScreenState extends State<MapScreen> {
       _activeCategory = null;
       // One selection at a time: a place supersedes a hand-picked point.
       _pickedPoint = null;
+      _pickedPlaceDetail = null;
+      _pickedDetailLoading = false;
     });
     _mapController.move(place.point, 16);
     _expandSheet();
@@ -227,10 +238,11 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  void _expandSheet() {
+  /// Springs the sheet open to [fraction] of the screen.
+  void _expandSheet({double fraction = 0.45}) {
     if (!_sheetController.isAttached) return;
     _sheetController.animateTo(
-      0.55,
+      fraction,
       duration: const Duration(milliseconds: 280),
       curve: Curves.easeOutCubic,
     );
@@ -325,7 +337,8 @@ class _MapScreenState extends State<MapScreen> {
       _sheetMode = _SheetMode.transport;
     });
     _mapController.move(result.point, 15);
-    _expandSheet();
+    // Transport is the densest sheet: a single snap must show a few routes.
+    _expandSheet(fraction: 0.62);
   }
 
   void _quickSearch(String term) {
@@ -351,7 +364,7 @@ class _MapScreenState extends State<MapScreen> {
           _sheetMode = _SheetMode.transport;
         });
         _mapController.move(place.point, 15);
-        _expandSheet();
+        _expandSheet(fraction: 0.62);
       case PlaceAction.tickets:
         _toast('Tickets are not wired up yet.');
       case PlaceAction.details:
@@ -416,6 +429,14 @@ class _MapScreenState extends State<MapScreen> {
                   } else if (event is MapEventMoveEnd && _mapBusy) {
                     setState(() => _mapBusy = false);
                   }
+                  // Track rotation so the compass can show heading, and only
+                  // appear once the map is actually off north.
+                  if (event is MapEventRotate) {
+                    final next = _mapController.camera.rotation;
+                    if ((next - _rotation).abs() > 0.5) {
+                      setState(() => _rotation = next);
+                    }
+                  }
                 },
                 onTap: (_, point) {
                   // Tapping the map drops a pin there. This supersedes a place
@@ -426,7 +447,15 @@ class _MapScreenState extends State<MapScreen> {
                     _pickedPoint = point;
                     _selectedPlace = null;
                     _sheetMode = _SheetMode.picked;
+                    _pickedPlaceDetail = null;
                   });
+                  debugPrint('[RevMap] picked ${point.latitude},'
+                      '${point.longitude}');
+                  _describePickedPoint(point);
+                  // Open straight away: the picked card is taller than the
+                  // collapsed peek, so leaving it shut would hide the very
+                  // details the user just asked for.
+                  _expandSheet();
                 },
               ),
               children: [
@@ -581,6 +610,12 @@ class _MapScreenState extends State<MapScreen> {
                   tooltip: 'Map layers',
                   onPressed: _openLayers,
                 ),
+                // Only worth the space once the map is off north.
+                if (_rotation.abs() > 0.5)
+                  CompassButton(
+                    rotationDegrees: _rotation,
+                    onTap: _resetNorth,
+                  ),
                 MapControlButton(
                   icon: _locating
                       ? Icons.location_searching_rounded
@@ -700,11 +735,43 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  /// Asks the geocoder what is at [point] so the picked sheet can show a real
+  /// name and address rather than bare coordinates.
+  ///
+  /// A failure is deliberately silent: coordinates alone are still useful, so a
+  /// dead network must not leave the sheet empty or block the pick.
+  Future<void> _describePickedPoint(LatLng point) async {
+    setState(() => _pickedDetailLoading = true);
+    try {
+      final detail = await _geocoding.reverse(
+        latitude: point.latitude,
+        longitude: point.longitude,
+      );
+      // A newer tap may have superseded this one.
+      if (!mounted || _pickedPoint != point) return;
+      setState(() {
+        _pickedPlaceDetail = detail;
+        _pickedDetailLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _pickedDetailLoading = false);
+    }
+  }
+
+  /// Snaps the map back to north.
+  void _resetNorth() {
+    _mapController.rotate(0);
+    setState(() => _rotation = 0);
+  }
+
   Widget _buildPickedSheet() {
     final point = _pickedPoint;
     if (point == null) return const SizedBox.shrink();
     return _PickedPointSheet(
       point: point,
+      detail: _pickedPlaceDetail,
+      detailLoading: _pickedDetailLoading,
       distanceLabel: _myLocation == null
           ? null
           : 'You are ${_formatDistance(_haversineKm(_myLocation!.point, point))} away',
@@ -721,6 +788,8 @@ class _MapScreenState extends State<MapScreen> {
       },
       onClear: () => setState(() {
         _pickedPoint = null;
+        _pickedPlaceDetail = null;
+        _pickedDetailLoading = false;
         _sheetMode = _SheetMode.discovery;
       }),
     );
@@ -760,12 +829,15 @@ class _MapScreenState extends State<MapScreen> {
 
 /// Sheet content for a point the user tapped on the map.
 ///
-/// Deliberately terse: the coordinates are the fact, and the two useful moves
-/// are "route here" and "copy". This is also the gesture a store owner will use
-/// to place a listing, so the coordinates must be readable at a glance.
+/// Reverse geocoding names the point, so the card leads with a real place or
+/// address rather than raw coordinates — a bare "12.97, 77.59" is not a
+/// description of anywhere. Coordinates stay visible underneath, because this
+/// is also the gesture a store owner uses to place a listing and will need them.
 class _PickedPointSheet extends StatelessWidget {
   const _PickedPointSheet({
     required this.point,
+    this.detail,
+    this.detailLoading = false,
     this.distanceLabel,
     this.onRoute,
     this.onCopy,
@@ -773,6 +845,10 @@ class _PickedPointSheet extends StatelessWidget {
   });
 
   final LatLng point;
+
+  /// What the geocoder says is here, once resolved.
+  final SearchResult? detail;
+  final bool detailLoading;
   final String? distanceLabel;
   final VoidCallback? onRoute;
   final VoidCallback? onCopy;
@@ -808,13 +884,57 @@ class _PickedPointSheet extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Picked location', style: AppTokens.titleSm),
+                    // Named place first: that is what the user recognises.
+                    if (detailLoading)
+                      Row(
+                        children: [
+                          const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 1.8),
+                          ),
+                          const SizedBox(width: AppTokens.s8),
+                          Flexible(
+                            child: Text(
+                              'Looking up this location…',
+                              style: AppTokens.caption,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      )
+                    else if (detail != null)
+                      Text(
+                        detail!.title,
+                        style: AppTokens.titleSm,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      )
+                    else
+                      Text('Picked location', style: AppTokens.titleSm),
                     const SizedBox(height: 2),
                     Text(
-                      '${point.latitude.toStringAsFixed(5)}, '
-                      '${point.longitude.toStringAsFixed(5)}',
+                      detail?.subtitle.isNotEmpty == true
+                          ? detail!.subtitle
+                          : '${point.latitude.toStringAsFixed(5)}, '
+                              '${point.longitude.toStringAsFixed(5)}',
                       style: AppTokens.metadata,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
                     ),
+                    // Coordinates are kept even when named: this is how a store
+                    // owner would confirm exactly where a listing will sit.
+                    if (detail != null) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        '${point.latitude.toStringAsFixed(5)}, '
+                        '${point.longitude.toStringAsFixed(5)}',
+                        style: AppTokens.metadata.copyWith(
+                          color: AppTokens.textMuted,
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),

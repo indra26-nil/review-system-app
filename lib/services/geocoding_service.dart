@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 
@@ -23,12 +24,18 @@ class GeocodingException implements Exception {
 /// two stay consistent. Attribution to OpenStreetMap contributors is still
 /// required and is shown under the result list.
 class GeocodingService {
-  GeocodingService({http.Client? client}) : _client = client ?? http.Client();
+  GeocodingService({http.Client? client})
+      : _client = client ?? debugClient ?? http.Client();
+
+  /// Lets a test inject a fake HTTP client, so geocoding can be exercised
+  /// without touching the network. Null in normal use.
+  static http.Client? debugClient;
 
   final http.Client _client;
 
   static const _host = 'photon.komoot.io';
   static const _path = '/api';
+  static const _reversePath = '/reverse';
 
   /// Identifying string, as the OSM Foundation asks every client to send.
   static const _userAgent =
@@ -107,9 +114,56 @@ class GeocodingService {
     }
   }
 
+  /// Looks up what is at [latitude]/[longitude] — the reverse of [search].
+  ///
+  /// Returns `null` when the point is nowhere interesting (open country, sea),
+  /// which is a normal answer rather than an error: the UI then falls back to
+  /// showing bare coordinates.
+  Future<SearchResult?> reverse({
+    required double latitude,
+    required double longitude,
+  }) async {
+    await _respectRateLimit();
+
+    final uri = Uri.https(_host, _reversePath, {
+      'lat': latitude.toStringAsFixed(6),
+      'lon': longitude.toStringAsFixed(6),
+      'lang': 'en',
+    });
+
+    final http.Response response;
+    try {
+      response = await _client
+          .get(uri, headers: {'User-Agent': _userAgent})
+          .timeout(const Duration(seconds: 12));
+    } catch (_) {
+      return null;
+    }
+    debugPrint('[RevMap] reverse ${response.statusCode} at '
+        '${latitude.toStringAsFixed(4)},${longitude.toStringAsFixed(4)}');
+    if (response.statusCode != 200) return null;
+
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic>) return null;
+      final features = decoded['features'];
+      if (features is! List || features.isEmpty) {
+        debugPrint('[RevMap] reverse: nothing found at '
+            '${latitude.toStringAsFixed(4)},${longitude.toStringAsFixed(4)}');
+        return null;
+      }
+      final first = features.first;
+      if (first is! Map<String, dynamic>) return null;
+      final result = SearchResult.fromPhoton(first);
+      debugPrint('[RevMap] reverse -> ${result.title}');
+      return result;
+    } on FormatException {
+      return null;
+    }
+  }
+
   /// Completes once enough time has passed since the last request.
-  Future<void> _respectRateLimit() {
-    final last = _lastRequestAt;
+  Future<void> _respectRateLimit() {    final last = _lastRequestAt;
     if (last == null) {
       _lastRequestAt = DateTime.now();
       return Future.value();
