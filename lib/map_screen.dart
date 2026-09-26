@@ -10,14 +10,24 @@ import 'data/sample_data.dart';
 import 'models/map_layer.dart';
 import 'models/place.dart';
 import 'models/search_result.dart';
+import 'screens/auth_screen.dart';
+import 'screens/owner_dashboard.dart';
+import 'screens/simulator_screen.dart';
+import 'services/api_client.dart';
+import 'services/auth_service.dart';
 import 'services/geocoding_service.dart';
 import 'services/location_service.dart';
+import 'services/places_repository.dart';
+import 'services/reviews_repository.dart';
+import 'services/simulation_repository.dart';
+import 'services/stores_repository.dart';
 import 'theme/app_tokens.dart';
 import 'widgets/compass.dart';
 import 'widgets/floating_search.dart';
 import 'widgets/map_layers_sheet.dart';
 import 'widgets/place_card.dart';
 import 'widgets/place_marker.dart';
+import 'widgets/place_review_sheet.dart';
 import 'widgets/search_results_panel.dart';
 import 'widgets/transport_sheet.dart';
 
@@ -46,6 +56,12 @@ class _MapScreenState extends State<MapScreen> {
   final MapController _mapController = MapController();
   final GeocodingService _geocoding = GeocodingService();
   final DeviceLocationService _location = const DeviceLocationService();
+  late final ApiClient _api = ApiClient();
+  late final PlacesRepository _placesRepo = PlacesRepository(_api);
+  final AuthService _auth = AuthService();
+
+  /// Signed-in person, or null when browsing anonymously.
+  Account? _account;
   final TextEditingController _searchController = TextEditingController();
   final DraggableScrollableController _sheetController =
       DraggableScrollableController();
@@ -56,6 +72,7 @@ class _MapScreenState extends State<MapScreen> {
   Place? _selectedPlace;
   DeviceLocation? _myLocation;
   bool _locating = false;
+  bool _busyAll = false;
   String? _statusMessage;
 
   /// Dropped by tapping empty map, and the one selection mode that survives
@@ -103,15 +120,51 @@ class _MapScreenState extends State<MapScreen> {
   bool _searchLoading = false;
   String? _searchError;
 
+  // Places loaded from Supabase. Null means "not loaded yet", which is
+  // different from "loaded and there are none" (an empty list).
+  List<Place>? _remotePlaces;
+
+  /// Set when the backend could not be reached, so the UI can say so rather
+  /// than silently showing sample data as if it were real.
+  String? _dataSourceNote;
+
+  /// True when showing every published place rather than the current viewport,
+  /// so panning does not discard the wider list.
+  bool _showingAll = false;
+
+  /// Last time places were successfully loaded, shown in the source chip so a
+  /// stale map is obvious during a demonstration.
+  DateTime? _lastLoaded;
+
+  String get _loadedLabel {
+    final at = _lastLoaded;
+    if (at == null) return '';
+    final s = DateTime.now().difference(at).inSeconds;
+    return s < 5 ? 'just now' : s < 60 ? '${s}s ago' : '${(s / 60).floor()}m ago';
+  }
+
   bool get _searchPanelOpen =>
       _searchActive &&
       (_searchResults.isNotEmpty || _searchError != null || _searchLoading);
+
+  /// The only heights the sheet may rest at. Every _expandSheet call must use
+  /// one of these, or the sheet will animate and then snap away from itself.
+  static const List<double> _sheetSnapSizes = [0.12, 0.4, 0.62, 0.92];
 
   // ----------------------------------------------------------------- helpers
 
   MapBaseLayer get _baseLayer => MapBaseLayer.byId(_baseLayerId);
 
-  List<Place> get _visiblePlaces => SampleData.filter(_activeCategory);
+  /// Remote places when the backend answered, sample data otherwise. The
+  /// bundled data is a genuine fallback, not a stub: this device loses the
+  /// network regularly, and an empty map is worse than labelled sample data.
+  List<Place> get _allPlaces => _remotePlaces ?? SampleData.places;
+
+  List<Place> get _visiblePlaces {
+    final all = _allPlaces;
+    if (_activeCategory == null) return all;
+    return all.where((p) => p.category == _activeCategory).toList();
+  }
 
   LatLng get _userPoint =>
       _myLocation?.point ?? const LatLng(12.9716, 77.5946);
@@ -125,6 +178,13 @@ class _MapScreenState extends State<MapScreen> {
     // Ask for a position once the first frame is up, so the map controller is
     // attached before it is moved. locateMe() manages _locating itself.
     WidgetsBinding.instance.addPostFrameCallback((_) => locateMe());
+    // Pull places from the backend for the initial viewport. A failure leaves
+    // _remotePlaces null, so the map keeps showing the bundled sample data.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadPlaces());
+    // Isolate a connection failure from a bad query before anything else.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _api.probe());
+    // Restore a previous session so nobody is signed out between launches.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _restoreSession());
   }
 
   @override
@@ -133,6 +193,8 @@ class _MapScreenState extends State<MapScreen> {
     _searchFocus.dispose();
     _geocoding.dispose();
     _searchController.dispose();
+    _api.close();
+    _auth.close();
     _sheetController.dispose();
     super.dispose();
   }
@@ -147,6 +209,227 @@ class _MapScreenState extends State<MapScreen> {
   /// its content when a selection is made.
   void _onSheetScroll() {
     // Retained only so the controller has a listener; dismissal is explicit.
+  }
+
+  // ----------------------------------------------------------------- account
+
+  /// Restore a previous login, so returning users are not asked to sign in
+  /// again every launch.
+  Future<void> _restoreSession() async {
+    try {
+      final account = await _auth.restore();
+      if (account != null && mounted) setState(() => _account = account);
+    } catch (_) {
+      // A failed restore is not an error the user needs to see; browsing
+      // anonymously still works.
+    }
+  }
+
+  /// Opens sign-in, or the sign-out confirmation when already signed in.
+  Future<void> _openAccount() async {
+    final account = _account;
+    if (account == null) {
+      final signedIn = await Navigator.of(context).push<bool>(
+        MaterialPageRoute(builder: (_) => AuthScreen(auth: _auth)),
+      );
+      if (signedIn == true && mounted) {
+        setState(() => _account = _auth.account);
+        _toast('Signed in as ${_auth.account?.displayName ?? ''}');
+      }
+      return;
+    }
+
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: AppTokens.background,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(AppTokens.radiusSheet)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AppTokens.grabber,
+            ListTile(
+              leading: const CircleAvatar(
+                backgroundColor: AppTokens.accentSoft,
+                child: Icon(Icons.person, color: AppTokens.accent),
+              ),
+              title: Text(account.displayName, style: AppTokens.titleSm),
+              subtitle: Text(account.role.label, style: AppTokens.metadata),
+            ),
+            const Divider(height: 1),
+            if (account.isOwner)
+              ListTile(
+                leading: const Icon(Icons.storefront_outlined),
+                title: const Text('Your business'),
+                subtitle: const Text('Register a store and list your places'),
+                onTap: () => Navigator.of(sheetContext).pop('owner'),
+              ),
+            ListTile(
+              leading: const Icon(Icons.tune_rounded),
+              title: const Text('Trust simulator'),
+              subtitle: const Text('Drive the scoring model by hand'),
+              onTap: () => Navigator.of(sheetContext).pop('simulator'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.logout_rounded, color: AppTokens.danger),
+              title: const Text('Sign out', style: TextStyle(color: AppTokens.danger)),
+              onTap: () => Navigator.of(sheetContext).pop('signout'),
+            ),
+            const SizedBox(height: AppTokens.s8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+
+    if (action == 'simulator') {
+      final repo = SimulationRepository(accessToken: _auth.accessToken);
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => SimulatorScreen(
+            repository: repo,
+            places: _allPlaces,
+            initialPlace: _selectedPlace,
+          ),
+        ),
+      );
+      repo.close();
+      if (mounted) _loadPlaces();
+    } else if (action == 'owner') {
+      final token = _auth.accessToken;
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => OwnerDashboard(
+            account: account,
+            repositories: (t) => StoresRepository(accessToken: t ?? token),
+          ),
+        ),
+      );
+      if (mounted) _loadPlaces(); // a newly published place should appear
+    } else if (action == 'signout') {
+      await _auth.signOut();
+      if (mounted) {
+        setState(() => _account = null);
+        _toast('Signed out');
+      }
+    }
+  }
+
+  // -------------------------------------------------------------- places
+
+  /// Fetches places inside the current viewport.
+  ///
+  /// Failures are deliberately quiet about the network and loud in the UI: the
+  /// map keeps its markers, and a chip explains that they are sample data.
+  /// Re-fetches places and the view the user is actually looking at.
+  ///
+  /// The data changes underneath the app -- a store is registered in the
+  /// simulator, a review is posted -- and the map has no other way to notice.
+  Future<void> _refreshPlaces() async {
+    setState(() => _showingAll = false);
+    await _loadPlaces();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(
+          _dataSourceNote == null
+              ? 'Updated'
+              : 'Could not refresh: ${_dataSourceNote!}',
+        ),
+        duration: const Duration(seconds: 2),
+      ));
+  }
+
+  /// Fits the camera to every published place.
+  ///
+  /// Listings can be created anywhere, and the viewport query only reaches a
+  /// few kilometres. Without this, a place made in another city is simply
+  /// absent from the map and its reviews are unreachable.
+  Future<void> _showAllPlaces() async {
+    setState(() => _busyAll = true);
+    try {
+      final all = await _placesRepo.fetchAll();
+      if (!mounted) return;
+      if (all.isEmpty) {
+        _toast('No published places');
+        return;
+      }
+      setState(() {
+        _remotePlaces = all;
+        _showingAll = true;
+        _dataSourceNote = null;
+      });
+      if (all.length == 1) {
+        _mapController.move(all.first.point, 15);
+      } else {
+        _mapController.fitCamera(
+          CameraFit.coordinates(
+            coordinates: all.map((p) => p.point).toList(),
+            padding: const EdgeInsets.fromLTRB(56, 180, 56, 320),
+            maxZoom: 15,
+          ),
+        );
+      }
+      _toast('Showing ${all.length} places');
+    } on ApiException catch (e) {
+      if (mounted) _toast(e.userMessage);
+    } finally {
+      if (mounted) setState(() => _busyAll = false);
+    }
+  }
+
+  Future<void> _loadPlaces() async {
+    final camera = _mapController.camera;
+    try {
+      // The phone's DNS is unreliable: a host that pings can still fail to
+      // resolve a moment later, so a single attempt is not proof the backend is
+      // down. Retry briefly before falling back to sample data.
+      List<Place>? places;
+      ApiException? last;
+      for (var attempt = 1; attempt <= 3; attempt++) {
+        try {
+          places = await _placesRepo.fetchInBounds(camera.center, camera.zoom);
+          break;
+        } on ApiException catch (e) {
+          last = e;
+          if (e.kind != ApiErrorKind.network) {
+            break;  // a rejection will not fix itself by asking again
+          }
+          if (attempt < 3) {
+            debugPrint('[RevMap] load attempt $attempt failed (${e.kind}), retrying');
+            await Future<void>.delayed(Duration(milliseconds: 600 * attempt));
+          }
+        }
+      }
+      if (places == null) {
+        throw last ?? ApiException(ApiErrorKind.unknown, 'Could not load places');
+      }
+
+      if (!mounted) return;
+      _lastLoaded = DateTime.now();
+      setState(() {
+        _remotePlaces = places;
+        _dataSourceNote = null;   // live data: nothing to explain
+      });
+      // Makes the data source unambiguous in logcat: without this there is no
+      // way to tell a live load from a silent fallback.
+      debugPrint('[RevMap] loaded ${places.length} place(s) from Supabase');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      debugPrint('[RevMap] falling back to sample data: ${e.kind} ${e.message}');
+      setState(() {
+        _remotePlaces = null;
+        _dataSourceNote = switch (e.kind) {
+          ApiErrorKind.notConfigured => 'Backend not configured',
+          ApiErrorKind.network => 'Offline \u2014 showing sample places',
+          _ => e.userMessage,
+        };
+      });
+    }
   }
 
   // -------------------------------------------------------------- my location
@@ -210,7 +493,7 @@ class _MapScreenState extends State<MapScreen> {
       _pickedDetailLoading = false;
     });
     _mapController.move(place.point, 16);
-    _expandSheet();
+    _expandSheet(fraction: 0.62);
   }
 
   void _onCategorySelected(PlaceCategory? category) {
@@ -239,7 +522,11 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   /// Springs the sheet open to [fraction] of the screen.
-  void _expandSheet({double fraction = 0.45}) {
+  ///
+  /// [fraction] must be one of [sheetSnapSizes]. With `snap: true`, a value
+  /// outside that list animates the sheet to a position it then immediately
+  /// snaps away from, which reads as the sheet "floating" or bouncing.
+  void _expandSheet({double fraction = 0.4}) {
     if (!_sheetController.isAttached) return;
     _sheetController.animateTo(
       fraction,
@@ -370,8 +657,39 @@ class _MapScreenState extends State<MapScreen> {
       case PlaceAction.details:
         _toast('Full details are not wired up yet.');
       case PlaceAction.reviews:
-        _toast('Reviews arrive with the backend.');
+        _openReviews(place);
     }
+  }
+
+  /// Opens the place's reviews, aggregate and composer.
+  ///
+  /// A repository is built per open so it carries the token of whoever is
+  /// signed in right now, rather than a token captured at startup.
+  Future<void> _openReviews(Place place) async {
+    final repository = ReviewsRepository(accessToken: _auth.accessToken);
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppTokens.background,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(AppTokens.radiusSheet)),
+      ),
+      builder: (_) => DraggableScrollableSheet(
+        // Reviews are a long list, so give them most of the screen.
+        initialChildSize: 0.75,
+        minChildSize: 0.4,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (context, controller) => PlaceReviewSheet(
+          place: place,
+          repository: repository,
+          signedIn: _auth.isSignedIn,
+          distanceLabel: place.distanceLabelFrom(_userPoint),
+          scrollController: controller,
+        ),
+      ),
+    );
+    repository.close();
   }
 
   void _toast(String message) {
@@ -428,6 +746,7 @@ class _MapScreenState extends State<MapScreen> {
                     setState(() => _mapBusy = true);
                   } else if (event is MapEventMoveEnd && _mapBusy) {
                     setState(() => _mapBusy = false);
+                    _loadPlaces();
                   }
                   // Track rotation so the compass can show heading, and only
                   // appear once the map is actually off north.
@@ -455,7 +774,7 @@ class _MapScreenState extends State<MapScreen> {
                   // Open straight away: the picked card is taller than the
                   // collapsed peek, so leaving it shut would hide the very
                   // details the user just asked for.
-                  _expandSheet();
+                  _expandSheet(fraction: 0.62);
                 },
               ),
               children: [
@@ -598,6 +917,18 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
 
+          // ---- 3. data-source honesty chip ----------------------------
+          if (_dataSourceNote != null || _lastLoaded != null)
+            Positioned(
+              left: AppTokens.gutter,
+              bottom: _sheetPeek() + AppTokens.s12,
+              child: _SourceChip(
+                note: _dataSourceNote ?? 'Updated $_loadedLabel'
+                    '${_showingAll ? ' — showing all places' : ''}',
+                onRetry: _loadPlaces,
+              ),
+            ),
+
           // ---- 3. floating map controls --------------------------------
           Positioned(
             right: AppTokens.gutter,
@@ -605,6 +936,27 @@ class _MapScreenState extends State<MapScreen> {
             bottom: _sheetPeek() + AppTokens.s12,
             child: MapControlStack(
               children: [
+                MapControlButton(
+                  icon: _account == null
+                      ? Icons.account_circle_outlined
+                      : Icons.account_circle_rounded,
+                  tooltip: _account == null ? 'Sign in' : _account!.displayName,
+                  isActive: _account != null,
+                  onPressed: _openAccount,
+                ),
+                MapControlButton(
+                  icon: _busyAll
+                      ? Icons.hourglass_empty_rounded
+                      : Icons.travel_explore_rounded,
+                  tooltip: 'Show all places',
+                  isActive: _showingAll,
+                  onPressed: _busyAll ? () {} : _showAllPlaces,
+                ),
+                MapControlButton(
+                  icon: Icons.refresh_rounded,
+                  tooltip: 'Refresh places',
+                  onPressed: _refreshPlaces,
+                ),
                 MapControlButton(
                   icon: Icons.layers_rounded,
                   tooltip: 'Map layers',
@@ -674,7 +1026,7 @@ class _MapScreenState extends State<MapScreen> {
       initialChildSize: 0.12,
       maxChildSize: 0.92,
       snap: true,
-      snapSizes: const [0.12, 0.4, 0.62, 0.92],
+      snapSizes: _sheetSnapSizes,
       builder: (context, scrollController) {
         return DecoratedBox(
           decoration: BoxDecoration(
@@ -823,6 +1175,58 @@ class _MapScreenState extends State<MapScreen> {
       origin: 'Your location',
       destination: dest,
       routes: TransportSheet.sampleRoutes(),
+    );
+  }
+}
+
+/// Explains that the markers on screen are not live data, and offers a retry.
+///
+/// Shown whenever the backend could not be reached. Without it, sample places
+/// would look exactly like real ones, which is the opposite of trustworthy.
+class _SourceChip extends StatelessWidget {
+  const _SourceChip({required this.note, this.onRetry});
+
+  final String note;
+  final VoidCallback? onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 6, 8),
+      constraints: const BoxConstraints(maxWidth: 300),
+      decoration: BoxDecoration(
+        color: AppTokens.background,
+        borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+        boxShadow: AppTokens.controlShadow,
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.cloud_off_rounded,
+              size: 16, color: AppTokens.textMuted),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              note,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: AppTokens.metadata.copyWith(
+                color: AppTokens.textSecondary,
+              ),
+            ),
+          ),
+          if (onRetry != null)
+            TextButton(
+              onPressed: onRetry,
+              style: TextButton.styleFrom(
+                minimumSize: const Size(0, 32),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                visualDensity: VisualDensity.compact,
+              ),
+              child: const Text('Retry', style: TextStyle(fontSize: 12.5)),
+            ),
+        ],
+      ),
     );
   }
 }

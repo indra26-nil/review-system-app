@@ -70,6 +70,17 @@ class PlaceCard extends StatelessWidget {
               bottom: AppTokens.s12,
               child: _CategoryTag(category: place.category),
             ),
+            // Reviews are usually what you want next, so they are offered on
+            // the image as well as in the action row below.
+            Positioned(
+              right: AppTokens.s12,
+              bottom: AppTokens.s12,
+              child: _ReviewButton(
+                onTap: () => onReviews != null
+                    ? onReviews!()
+                    : onAction?.call(PlaceAction.reviews),
+              ),
+            ),
           ],
         ),
         Padding(
@@ -321,6 +332,40 @@ class _PillAction extends StatelessWidget {
                   ),
                 ),
               ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ReviewButton extends StatelessWidget {
+  const _ReviewButton({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppTokens.background,
+      borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(AppTokens.radiusPill),
+        child: const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.rate_review_outlined,
+                  size: 15, color: AppTokens.textPrimary),
+              SizedBox(width: 5),
+              Text('Reviews',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: AppTokens.textPrimary,
+                  )),
             ],
           ),
         ),

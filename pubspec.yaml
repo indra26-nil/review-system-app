@@ -39,6 +39,9 @@ dependencies:
   # Place search (Nominatim / OpenStreetMap). Already present as a transitive
   # dependency of flutter_map, so this does not add a new download.
   http: ^1.6.0
+  # Persists the session so the user is not signed out between launches.
+  # Already in the local package cache, so this resolves offline.
+  shared_preferences: ^2.5.5
 
 dev_dependencies:
   flutter_test:

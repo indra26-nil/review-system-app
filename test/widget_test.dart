@@ -91,7 +91,9 @@ void main() {
     expect(find.text(place.name), findsOneWidget);
     expect(find.text('Directions'), findsOneWidget);
     expect(find.text('Tickets'), findsOneWidget);
-    expect(find.text('Reviews'), findsOneWidget);
+    // Reviews is offered twice on purpose: as a button on the hero image
+    // and in the action row, because it is what people want next.
+    expect(find.text('Reviews'), findsNWidgets(2));
   });
 
   test('distance label switches from metres to kilometres', () {

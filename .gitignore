@@ -53,3 +53,7 @@ app.*.map.json
 # Android local paths
 android/local.properties
 android/build/
+
+# Real secrets — never commit. See .env.example for the shape.
+.env
+simulator/
